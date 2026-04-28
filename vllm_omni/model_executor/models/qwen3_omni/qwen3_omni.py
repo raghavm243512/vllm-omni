@@ -218,6 +218,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         audio_stream: AsyncGenerator[np.ndarray, None],
         input_stream: asyncio.Queue[list[int]],
         model_config: ModelConfig,
+        conversation_context: str | None = None,
     ) -> AsyncGenerator[PromptType, None]:
         processor = cached_processor_from_config(model_config)
         feature_extractor = processor.feature_extractor
@@ -236,6 +237,18 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         prompt_token_ids = tokenizer.encode(prompt_template)
 
+        # If conversation context is provided, inject it as the first prompt
+        # This allows tool results and conversation history to be included
+        is_first_chunk = True
+        if conversation_context:
+            # Build context prompt with system instructions + conversation history
+            context_prompt = f"<|im_start|>system\n{conversation_context}<|im_end|>\n"
+            context_token_ids = tokenizer.encode(context_prompt)
+            is_first_chunk = False
+
+            # Yield context as the first prompt
+            yield TokensPrompt(prompt_token_ids=context_token_ids)
+
         async for audio_chunk in audio_stream:
             buffer.write_audio(audio_chunk)
 
@@ -244,6 +257,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                     prompt_token_ids=prompt_token_ids,
                     multi_modal_data={"audio": segment},
                 )
+                is_first_chunk = False
 
         remaining = buffer.flush()
         if remaining is not None and len(remaining) > 0:
@@ -932,6 +946,12 @@ class Qwen3OmniMoeForConditionalGeneration(
                 continue
             # Talker takes word embeddings for tokens and hidden state from `accept_hidden_layer` for multimodal inputs
             elif (role_token == self.config.user_token_id).item():
+                # Skip text-only user sections (e.g. tool responses) — they
+                # have no audio tokens, so all positions would route through
+                # text_projection and produce garbled speech.
+                user_mm_mask = multimodal_mask[im_start_index:segment_end_index]
+                if not user_mm_mask.any():
+                    continue
                 talker_user_part = self._get_talker_user_parts(
                     im_start_index, segment_end_index, multimodal_mask, thinker_hidden, thinker_embed
                 )
