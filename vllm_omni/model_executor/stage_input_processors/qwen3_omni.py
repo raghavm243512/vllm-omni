@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 _EMBED_LAYER_KEY = "0"
 _HIDDEN_LAYER_KEY = "24"
 
+# Maximum codec tokens the code2wav stage can process in one step, set by
+# max_num_batched_tokens in the stage 2 config. Exceeding this causes vLLM to
+# silently truncate, producing garbled or cut-off audio.
+_CODE2WAV_MAX_BATCHED_TOKENS = 65536
+
+# Qwen3-Omni codec framerate (tokens per second of audio)
+_CODEC_TOKENS_PER_SEC = 75
+
 
 def _compute_talker_prompt_ids_length(info: OmniPayload, device: torch.device | str = "cuda") -> int:
     im_start_token_id = 151644
@@ -594,13 +602,6 @@ def talker2code2wav(
     Returns:
         List of OmniTokensPrompt for code2wav stage
     """
-    # Max codec tokens code2wav can process in a single step. This is set by
-    # max_num_batched_tokens in the code2wav stage config. Responses that
-    # produce codec_codes_len > this limit will be silently truncated by
-    # vLLM, causing garbled or cut-off audio. Raise the limit in the YAML
-    # if you hit the warning below.
-    _CODE2WAV_MAX_BATCHED_TOKENS = 65536  # matches stage 2 max_num_batched_tokens
-
     talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
     code2wav_inputs: list[OmniTokensPrompt] = []
     # Process each talker output
@@ -624,7 +625,8 @@ def talker2code2wav(
                 "silently truncated, producing garbled or cut-off audio. "
                 "Raise max_num_batched_tokens and max_model_len for the code2wav stage "
                 "in the YAML config if this happens.",
-                len(codec_codes), _CODE2WAV_MAX_BATCHED_TOKENS, seq_len / 75.0,
+                len(codec_codes), _CODE2WAV_MAX_BATCHED_TOKENS,
+                seq_len / _CODEC_TOKENS_PER_SEC,
             )
         code2wav_inputs.append(
             OmniTokensPrompt(

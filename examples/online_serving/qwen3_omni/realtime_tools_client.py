@@ -3,17 +3,22 @@
 This client:
 1) Connects to /v1/realtime WebSocket endpoint
 2) Sends session.update with tool definitions
-3) Streams audio input
-4) Receives tool call requests from the model
-5) Executes tools locally and sends results back
-6) Receives audio response incorporating tool results
+3) For each input WAV (one or more): streams audio, drains events, executes
+   any tool call, and waits for response.audio.done before moving on
+4) Saves the audio response from each turn
 
-Usage:
+Single-turn usage:
   python realtime_tools_client.py \\
       --url ws://localhost:8091/v1/realtime \\
       --model Qwen/Qwen3-Omni-30B-A3B-Instruct \\
       --input-wav input_16k_mono.wav \\
       --output-wav tool_output.wav
+
+Multi-turn usage (multiple WAVs over one WebSocket session — proves
+conversation context is retained across turns):
+  python realtime_tools_client.py \\
+      --input-wav greeting.wav weather_paris.wav weather_london.wav \\
+      --output-wav response.wav   # writes response_turn1.wav, _turn2.wav, ...
 
 Dependencies:
   pip install websockets
@@ -25,6 +30,7 @@ import argparse
 import asyncio
 import base64
 import json
+import time
 import wave
 from pathlib import Path
 from datetime import datetime
@@ -149,160 +155,145 @@ TOOL_DEFINITIONS = [
 ]
 
 
-async def run_client(url: str, model: str, input_wav: Path, output_wav: Path):
-    """Main client logic."""
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Connecting to {url}")
+def _ts() -> str:
+    return datetime.now().strftime("%H:%M:%S")
 
-    audio_responses = []
+
+def _turn_output_path(base: Path, turn_idx: int, total_turns: int) -> Path:
+    """For single-turn, use --output-wav verbatim. For multi-turn, suffix it."""
+    if total_turns == 1:
+        return base
+    return base.with_name(f"{base.stem}_turn{turn_idx + 1}{base.suffix}")
+
+
+async def _send_audio(ws, pcm: bytes, chunk_size: int = 4096) -> None:
+    for i in range(0, len(pcm), chunk_size):
+        b64 = base64.b64encode(pcm[i:i + chunk_size]).decode("utf-8")
+        await ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": b64}))
+    await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": False}))
+
+
+async def _run_turn(ws, label: str) -> tuple[bytes, int, float, float]:
+    """Drain events until response.audio.done, executing any tool calls inline.
+
+    Returns (audio_pcm, sample_rate, ttfa_s, total_s). The caller is responsible
+    for having already sent + committed the user audio.
+    """
+    audio_chunks: list[bytes] = []
     sample_rate = 24000
+    pending_tool_calls: dict[str, dict] = {}
 
-    async with websockets.connect(url) as ws:
-        # 1. Receive session.created
+    t_start = time.monotonic()
+    t_first_audio: float | None = None
+
+    while True:
         msg = await ws.recv()
         event = json.loads(msg)
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Received: {event.get('type')}")
+        etype = event.get("type")
 
-        # 2. Send session.update with model and tools
-        session_update = {
+        if etype == "response.audio.delta":
+            sample_rate = event.get("sample_rate_hz", sample_rate)
+            chunk = base64.b64decode(event.get("audio", ""))
+            audio_chunks.append(chunk)
+            if t_first_audio is None:
+                t_first_audio = time.monotonic()
+                print(f"  [{label}] first audio delta (TTFA={t_first_audio - t_start:.2f}s)")
+        elif etype == "response.audio.done":
+            print(f"  [{label}] audio.done ({len(audio_chunks)} chunks)")
+            break
+        elif etype == "response.text.done":
+            text = event.get("text", "")
+            if text:
+                print(f"  [{label}] text: {text[:120]}")
+        elif etype == "response.function_call_arguments.delta":
+            call_id = event.get("call_id")
+            pending_tool_calls.setdefault(call_id, {"name": event.get("name"), "arguments": ""})
+            pending_tool_calls[call_id]["arguments"] += event.get("delta", "")
+        elif etype == "response.function_call_arguments.done":
+            call_id = event.get("call_id")
+            name = event.get("name")
+            arguments_json = event.get("arguments", "{}")
+            print(f"  [{label}] tool call: {name}({arguments_json})")
+            try:
+                arguments = json.loads(arguments_json)
+            except json.JSONDecodeError:
+                arguments = {}
+            if name not in AVAILABLE_TOOLS:
+                print(f"  [{label}] ERROR: unknown tool {name!r}")
+                break
+            result = AVAILABLE_TOOLS[name](**arguments)
+            print(f"  [{label}] tool result: {result}")
+            await ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {"type": "function_call_output", "call_id": call_id, "output": result},
+            }))
+        elif etype == "error":
+            print(f"  [{label}] ERROR: {event.get('error', event)}")
+            break
+
+    total_s = time.monotonic() - t_start
+    ttfa_s = (t_first_audio - t_start) if t_first_audio is not None else float("nan")
+    return b"".join(audio_chunks), sample_rate, ttfa_s, total_s
+
+
+async def run_client(url: str, model: str, input_wavs: list[Path], output_wav: Path):
+    """Connect once, run a turn per input WAV, save audio per turn."""
+    print(f"[{_ts()}] Connecting to {url}")
+
+    async with websockets.connect(url) as ws:
+        msg = await ws.recv()
+        print(f"[{_ts()}] {json.loads(msg).get('type')}")
+
+        await ws.send(json.dumps({
             "type": "session.update",
             "model": model,
             "session": {
                 "tools": TOOL_DEFINITIONS,
-                "instructions": "You are a helpful assistant with access to tools. When the user asks about weather or calculations, use the appropriate tool."
-            }
-        }
-        await ws.send(json.dumps(session_update))
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Sent session.update with {len(TOOL_DEFINITIONS)} tools")
-
-        # 3. Read and send audio input
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Reading audio from {input_wav}")
-        pcm_data = _read_wav_pcm16(input_wav)
-
-        # Send in chunks
-        chunk_size = 4096
-        for i in range(0, len(pcm_data), chunk_size):
-            chunk = pcm_data[i:i + chunk_size]
-            b64_chunk = base64.b64encode(chunk).decode("utf-8")
-            await ws.send(json.dumps({
-                "type": "input_audio_buffer.append",
-                "audio": b64_chunk
-            }))
-
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Sent {len(pcm_data)} bytes of audio")
-
-        # 4. Commit audio
-        await ws.send(json.dumps({
-            "type": "input_audio_buffer.commit",
-            "final": False
+                "instructions": (
+                    "You are a helpful voice assistant with access to tools. "
+                    "Use the available tools to answer user questions when it makes sense to do so."
+                ),
+            },
         }))
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Committed audio buffer")
+        print(f"[{_ts()}] session.update sent ({len(TOOL_DEFINITIONS)} tools)")
 
-        # 5. Listen for responses
-        response_done = False
-        pending_tool_calls = {}
+        for turn_idx, in_wav in enumerate(input_wavs):
+            label = f"turn{turn_idx + 1}"
+            print(f"\n[{_ts()}] {label}: streaming {in_wav.name}")
+            pcm = _read_wav_pcm16(in_wav)
+            await _send_audio(ws, pcm)
 
-        while not response_done:
-            msg = await ws.recv()
-            event = json.loads(msg)
-            event_type = event.get("type")
+            audio_pcm, sample_rate, ttfa_s, total_s = await _run_turn(ws, label)
 
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Received: {event_type}")
-
-            if event_type == "response.audio.delta":
-                # Collect audio chunks
-                audio_b64 = event.get("audio", "")
-                sample_rate = event.get("sample_rate_hz", 24000)
-                audio_bytes = base64.b64decode(audio_b64)
-                audio_responses.append(audio_bytes)
-                print(f"  -> Audio chunk: {len(audio_bytes)} bytes")
-
-            elif event_type == "response.audio.done":
-                response_done = True
-                print(f"  -> Audio response complete")
-
-            elif event_type == "response.text.delta":
-                # Text streaming
-                delta = event.get("delta", "")
-                print(f"  -> Text: {delta}")
-
-            elif event_type == "response.text.done":
-                text = event.get("text", "")
-                print(f"  -> Full text: {text}")
-
-            elif event_type == "response.function_call_arguments.delta":
-                # Tool call in progress
-                call_id = event.get("call_id")
-                name = event.get("name")
-                delta = event.get("delta", "")
-
-                if call_id not in pending_tool_calls:
-                    pending_tool_calls[call_id] = {
-                        "id": call_id,
-                        "name": name,
-                        "arguments": ""
-                    }
-
-                pending_tool_calls[call_id]["arguments"] += delta
-                print(f"  -> Tool call delta: {name} - {delta}")
-
-            elif event_type == "response.function_call_arguments.done":
-                # Tool call complete - execute it
-                call_id = event.get("call_id")
-                name = event.get("name")
-                arguments_json = event.get("arguments", "{}")
-
-                print(f"  -> Tool call complete: {name}({arguments_json})")
-
-                # Parse arguments
-                try:
-                    arguments = json.loads(arguments_json)
-                except json.JSONDecodeError:
-                    arguments = {}
-
-                # Execute tool
-                if name in AVAILABLE_TOOLS:
-                    print(f"  -> Executing tool: {name}")
-                    tool_func = AVAILABLE_TOOLS[name]
-                    result = tool_func(**arguments)
-                    print(f"  -> Tool result: {result}")
-
-                    # Send result back
-                    tool_response = {
-                        "type": "conversation.item.create",
-                        "item": {
-                            "type": "function_call_output",
-                            "call_id": call_id,
-                            "output": result
-                        }
-                    }
-                    await ws.send(json.dumps(tool_response))
-                    print(f"  -> Sent tool result to server")
-
-                    # Reset response_done to wait for follow-up
-                    response_done = False
-                else:
-                    print(f"  -> ERROR: Unknown tool: {name}")
-
-            elif event_type == "error":
-                error_msg = event.get("error", {})
-                print(f"  -> ERROR: {error_msg}")
-                response_done = True
-
-    # 6. Save audio output
-    if audio_responses:
-        combined_audio = b"".join(audio_responses)
-        _write_wav_pcm16(output_wav, combined_audio, sample_rate)
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Saved audio to {output_wav}")
-    else:
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] No audio received")
+            if audio_pcm:
+                out_path = _turn_output_path(output_wav, turn_idx, len(input_wavs))
+                _write_wav_pcm16(out_path, audio_pcm, sample_rate)
+                duration_s = len(audio_pcm) / (sample_rate * 2)
+                print(
+                    f"  [{label}] saved {out_path.name} "
+                    f"({duration_s:.2f}s audio, TTFA={ttfa_s:.2f}s, total={total_s:.2f}s)"
+                )
+            else:
+                print(f"  [{label}] no audio received")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Realtime tool calling client")
     parser.add_argument("--url", default="ws://localhost:8091/v1/realtime", help="WebSocket URL")
     parser.add_argument("--model", default="Qwen/Qwen3-Omni-30B-A3B-Instruct", help="Model name")
-    parser.add_argument("--input-wav", type=Path, required=True, help="Input WAV file (mono, 16-bit, 16kHz)")
-    parser.add_argument("--output-wav", type=Path, default="tool_output.wav", help="Output WAV file")
+    parser.add_argument(
+        "--input-wav",
+        type=Path,
+        nargs="+",
+        required=True,
+        help="One or more input WAV files (mono, 16-bit, 16kHz). Multiple files run as sequential turns over a single WebSocket session.",
+    )
+    parser.add_argument(
+        "--output-wav",
+        type=Path,
+        default=Path("tool_output.wav"),
+        help="Output WAV path. With multiple input WAVs, '_turn{N}' is inserted before the suffix.",
+    )
 
     args = parser.parse_args()
 

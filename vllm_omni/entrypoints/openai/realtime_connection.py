@@ -6,18 +6,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import copy
 import json
+import time
 from collections.abc import AsyncGenerator
-from typing import TYPE_CHECKING, Any, cast
+from typing import cast
 from uuid import uuid4
 
-if TYPE_CHECKING:
-    from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
-
 import numpy as np
-import torch
-from vllm.entrypoints.openai.engine.protocol import UsageInfo
+from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel, UsageInfo
 from vllm.entrypoints.openai.realtime.connection import (
     RealtimeConnection as VllmRealtimeConnection,
 )
@@ -30,6 +26,15 @@ from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.openai.realtime_protocol import (
+    RealtimeEventType,
+    ResponseAudioDelta,
+    ResponseAudioDone,
+    ResponseFunctionCallArgumentsDelta,
+    ResponseFunctionCallArgumentsDone,
+    ResponseTextDelta,
+    ResponseTextDone,
+)
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 
 logger = init_logger(__name__)
@@ -46,6 +51,7 @@ class RealtimeConnection(VllmRealtimeConnection):
     - Text streaming alongside audio
     """
 
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.engine = cast(AsyncOmni, self.serving.engine_client)
@@ -55,13 +61,10 @@ class RealtimeConnection(VllmRealtimeConnection):
         self.tools: list[dict] | None = None
         self.instructions: str | None = None
         self.conversation_items: list[dict] = []
-        self.conversation_context: str | None = None
 
         # Tool call parsing state
         self.in_tool_call = False
-        self.tool_call_buffer = ""
         self.current_tool_calls: list[dict] = []
-        self.current_function_name: str | None = None
         self.current_tool_call_id: str | None = None
         self.accumulated_text = ""
         # Cursor into accumulated_text marking the start of the next unprocessed region.
@@ -79,11 +82,11 @@ class RealtimeConnection(VllmRealtimeConnection):
         # prompt produces garbled audio.
         self._cached_user_audio: list[np.ndarray] = []
 
-        # Acoustic reference for the audio pass. Set once from the first turn's user
-        # audio which produces clean speech through hidden_projection. Later turns may
-        # use a different speaker; keeping the first-turn reference maintains voice
-        # quality across turns.
-        self._turn_audio_cache: list[np.ndarray] | None = None
+        # Index into conversation_items marking the boundary between prior turns
+        # and the current turn. Captured at the start of every turn so the
+        # tool-context audio pass can frame prior history and current-turn tool
+        # interaction separately, keeping the temporal layout clear to the model.
+        self._turn_start_idx: int = 0
 
         # Tokenizer for decoding thinker text tokens
         self.tokenizer = None
@@ -102,27 +105,25 @@ class RealtimeConnection(VllmRealtimeConnection):
         """Override to handle tool-related events."""
         event_type = event.get("type")
 
-        if event_type == "session.update":
+        if event_type == RealtimeEventType.SESSION_UPDATE:
             session = event.get("session", {})
             self.tools = session.get("tools")
             self.instructions = session.get("instructions")
             logger.info(f"Session updated with {len(self.tools) if self.tools else 0} tools")
             await super().handle_event(event)
 
-        elif event_type == "input_audio_buffer.commit":
+        elif event_type == RealtimeEventType.INPUT_AUDIO_BUFFER_COMMIT:
             # Override commit handling: start generation AND close the audio stream
             # so buffer_realtime_audio() can flush and finish, which in turn lets
             # _add_streaming_input_request send resumable=False to the engine.
             # Without the None sentinel, the thinker stage never gets finished=True
             # and never forwards to talker→code2wav, so audio never arrives.
             commit_event = InputAudioBufferCommit(**event)
-            if commit_event.final:
-                self.audio_queue.put_nowait(None)
-            else:
+            if not commit_event.final:
                 await self.start_generation()
-                self.audio_queue.put_nowait(None)
+            self.audio_queue.put_nowait(None)
 
-        elif event_type == "conversation.item.create":
+        elif event_type == RealtimeEventType.CONVERSATION_ITEM_CREATE:
             item = event.get("item", {})
             await self._handle_conversation_item(item)
 
@@ -143,10 +144,6 @@ class RealtimeConnection(VllmRealtimeConnection):
             logger.info(f"Received tool result for call_id: {tool_result['call_id']}")
             await self._generate_with_tool_context()
 
-        elif item_type == "message":
-            self.conversation_items.append(item)
-            logger.debug(f"Added message to conversation: {item.get('role', 'unknown')}")
-
     async def _generate_with_tool_context(self):
         """Run audio-only generation after tool results have been received."""
         if self.generation_task is not None and not self.generation_task.done():
@@ -159,51 +156,8 @@ class RealtimeConnection(VllmRealtimeConnection):
 
         logger.info("Generating audio response with tool context")
         self.generation_task = asyncio.create_task(
-            self._run_audio_from_tool_context()
+            self._run_audio_from_tool_context(append_response=True)
         )
-
-    # -------------------------------------------------------------------------
-    # Sampling params helpers
-    # -------------------------------------------------------------------------
-
-    def _make_audio_sampling_params_list(self):
-        """Per-stage sampling params for realtime audio generation.
-
-        Forces thinker (stage 0) and talker (stage 1) to temperature=0.0 and
-        coerces all stages to DELTA output so code2wav batches are emitted to
-        the client incrementally rather than buffered until completion.
-        NOTE: a single sampling_params= to engine.generate() does NOT override
-        per-stage YAML defaults — only sampling_params_list= is respected.
-        """
-        default_spl = getattr(self.engine, "default_sampling_params_list", None)
-        if default_spl is None or len(default_spl) < 2:
-            logger.warning(
-                "default_sampling_params_list unavailable (got %s) — "
-                "audio pass will use YAML defaults unchanged",
-                default_spl,
-            )
-            return None
-        spl = copy.deepcopy(list(default_spl))
-        spl[0].temperature = 0.0
-        spl[1].temperature = 0.0
-        return coerce_param_message_types(spl, is_streaming=True)
-
-    def _make_text_sampling_params_list(self):
-        """Per-stage sampling params for the text-only thinker pass.
-
-        Forces thinker (stage 0) to temperature=0.0 so tool call detection is
-        fast and deterministic. Coerces all stages to DELTA output so each step
-        yields only NEW tokens — the loop in _run_generation does
-        `accumulated_text += _decode_tokens(token_ids)`, which would duplicate
-        text quadratically if token_ids were cumulative. Cumulative bloat saved
-        to conversation history then poisons subsequent turns.
-        """
-        default_spl = getattr(self.engine, "default_sampling_params_list", None)
-        if not default_spl:
-            return None
-        spl = copy.deepcopy(list(default_spl))
-        spl[0].temperature = 0.0
-        return coerce_param_message_types(spl, is_streaming=True)
 
     # -------------------------------------------------------------------------
     # Generation entry point
@@ -215,25 +169,41 @@ class RealtimeConnection(VllmRealtimeConnection):
             logger.warning("Generation already in progress, ignoring commit")
             return
 
+        # Snapshot boundary first, then append the user placeholder so it lands
+        # at index _turn_start_idx: inside current_items for this turn (filtered
+        # out by current_tool_items) and inside prior_items for future turns.
+        self._turn_start_idx = len(self.conversation_items)
+        self.conversation_items.append({"role": "user", "content": None})
+
+        if self.instructions and not self.tools:
+            # Instructions only — no tool calls possible, skip the text-only thinker
+            # pass entirely. Drain audio into _cached_user_audio then run the audio
+            # pass directly with the system instruction injected by
+            # _run_audio_from_tool_context.
+            self.generation_task = asyncio.create_task(self._drain_and_run_audio())
+            return
+
         audio_stream = self.audio_stream_generator()
         input_stream = asyncio.Queue[list[int]]()
 
-        # IMPORTANT: Only inject conversation_context when a text-only pass will run
-        # (i.e. tools are configured OR session instructions are set).
-        # Audio-only passes MUST receive context=None because buffer_realtime_audio
-        # splits a non-None context into a separate initial add_request, leaving
-        # audio tokens as streaming updates. That makes thinker_output.prompt_token_ids
-        # contain only system tokens — _compute_talker_prompt_ids_length finds no
-        # <|im_start|>user marker, returns 0, and the talker hits the decode path
-        # instead of prefill, crashing with "Missing prefill_consumed_text_tokens".
-        conversation_context = getattr(self, "conversation_context", None)
-        if conversation_context is None and (self.tools or self.instructions):
+        # IMPORTANT: Only inject conversation_context / prior_blocks when tools are
+        # configured. Audio-only passes MUST receive context=None because
+        # buffer_realtime_audio splits a non-None context into a separate initial
+        # add_request, leaving audio tokens as streaming updates. That makes
+        # thinker_output.prompt_token_ids contain only system tokens —
+        # _compute_talker_prompt_ids_length finds no <|im_start|>user marker,
+        # returns 0, and the talker hits the decode path instead of prefill,
+        # crashing with "Missing prefill_consumed_text_tokens".
+        if self.tools:
             conversation_context = self._build_system_context()
+            prior_blocks = self._render_prior_blocks()
+        else:
+            conversation_context = None
+            prior_blocks = None
 
         streaming_input_gen = self.serving.transcribe_realtime(
-            audio_stream, input_stream, conversation_context
+            audio_stream, input_stream, conversation_context, prior_blocks
         )
-        self.conversation_context = None
 
         self.generation_task = asyncio.create_task(
             self._run_generation(streaming_input_gen, input_stream)
@@ -311,12 +281,6 @@ class RealtimeConnection(VllmRealtimeConnection):
                 chunks.extend(self._raw_waveform_to_deltas(arr))
         return chunks, int(sr)
 
-    @staticmethod
-    def _pcm16_b64(audio_f32: np.ndarray) -> str:
-        clipped = np.clip(audio_f32, -1.0, 1.0)
-        pcm16 = (clipped * 32767.0).astype(np.int16)
-        return base64.b64encode(pcm16.tobytes()).decode("utf-8")
-
     # Maximum raw PCM bytes per WebSocket message for response.audio.delta.
     # Base64 encoding inflates by ~4/3, so 200 KB raw → ~267 KB on the wire.
     _AUDIO_DELTA_CHUNK_BYTES: int = 200 * 1024
@@ -333,13 +297,10 @@ class RealtimeConnection(VllmRealtimeConnection):
             piece = raw[i:i + size]
             if not piece:
                 break
-            await self.send_json(
-                {
-                    "type": "response.audio.delta",
-                    "audio": base64.b64encode(piece).decode("utf-8"),
-                    "sample_rate_hz": sample_rate,
-                }
-            )
+            await self.send(ResponseAudioDelta(
+                audio=base64.b64encode(piece).decode("utf-8"),
+                sample_rate_hz=sample_rate,
+            ))
 
     # -------------------------------------------------------------------------
     # Generation loops
@@ -361,21 +322,22 @@ class RealtimeConnection(VllmRealtimeConnection):
         self.current_tool_calls = []
         self._text_proc_cursor = 0
 
+        t_start = time.monotonic()
         try:
-            if self.tools or self.instructions:
-                # --- Text-only pass when tools are configured or instructions are set ---
-                # Run the thinker stage only (output_modalities=["text"]).
-                # If the model makes a tool call, we emit the event and stop;
-                # the client sends back a conversation.item.create with
-                # function_call_output, which triggers _run_audio_from_tool_context.
-                # If no tool calls, fall through to _run_audio_from_tool_context
-                # which rebuilds the prompt from _cached_user_audio.
-                text_request_id = request_id + "-txt"
+            if self.tools:
+                # --- Single combined text+audio pass with tool detection ---
+                # output_modalities=["text", "audio"]: in the dual-stage architecture,
+                # text tokens (stage 0 / thinker) arrive before audio (stage 2 / code2wav).
+                # We watch text for <tool_call> and abort cleanly before any audio is sent.
+                # For no-tool turns this avoids a sequential thinker pass followed by a
+                # full re-run audio pass — audio just flows through in one shot.
                 result_gen = self.engine.generate(
                     prompt=streaming_input_gen,
-                    sampling_params_list=self._make_text_sampling_params_list(),
-                    request_id=text_request_id,
-                    output_modalities=["text"],
+                    sampling_params_list=coerce_param_message_types(
+                        list(self.engine.default_sampling_params_list), is_streaming=True
+                    ),
+                    request_id=request_id,
+                    output_modalities=["text", "audio"],
                 )
                 async for output in result_gen:
                     if output.outputs:
@@ -384,18 +346,48 @@ class RealtimeConnection(VllmRealtimeConnection):
                             text_delta = self._decode_tokens(token_ids)
                             if text_delta:
                                 await self._process_text_delta(text_delta)
-                    # Abort as soon as a complete tool call is detected — don't
-                    # let the thinker keep generating hallucinated post-tool text.
+                    # Abort as soon as a complete tool call is detected. Text arrives
+                    # before audio in the pipeline, so this is always a clean abort
+                    # with no audio sent.
                     if self.current_tool_calls:
-                        await self.engine.abort(text_request_id)
+                        logger.info(
+                            "[TIMING] Tool call detected at %.2fs — aborting before audio",
+                            time.monotonic() - t_start,
+                        )
+                        await self.engine.abort(request_id)
                         break
+                    audio_chunks, sample_rate = self._extract_audio_chunks(output)
+                    for chunk in audio_chunks:
+                        if not sent_audio:
+                            logger.info(
+                                "[TIMING] First audio chunk at %.2fs (no tool call)",
+                                time.monotonic() - t_start,
+                            )
+                        sent_audio = True
+                        await self._send_audio_delta(chunk, sample_rate)
                     if not self._is_connected:
                         break
+
+                logger.info(
+                    "[TIMING] Generation loop finished: %.2fs | tool_calls=%d | sent_audio=%s",
+                    time.monotonic() - t_start,
+                    len(self.current_tool_calls),
+                    sent_audio,
+                )
+                logger.info("[TEXT] Raw thinker output: %r", self.accumulated_text)
+
+                if self.current_tool_calls:
+                    # Thinking text and raw <tool_call> XML are noise in history.
+                    assistant_content = None
+                else:
+                    raw = self._strip_thinking(self.accumulated_text)
+                    assistant_content = self._clean_text_delta(raw) or None
+                    logger.info("[TEXT] Visible assistant text: %r", assistant_content)
 
                 self.conversation_items.append(
                     {
                         "role": "assistant",
-                        "content": self.accumulated_text or None,
+                        "content": assistant_content,
                         "tool_calls": self.current_tool_calls or None,
                     }
                 )
@@ -405,32 +397,27 @@ class RealtimeConnection(VllmRealtimeConnection):
                         "Emitted %d tool call(s); waiting for client tool responses",
                         len(self.current_tool_calls),
                     )
-                    if self.accumulated_text:
-                        await self.send_json({"type": "response.text.done", "text": self.accumulated_text})
-                    while not self.audio_queue.empty():
-                        self.audio_queue.get_nowait()
+                    visible_text = self._clean_text_delta(self._strip_thinking(self.accumulated_text))
+                    if visible_text:
+                        await self.send(ResponseTextDone(text=visible_text))
                     if self._pending_tool_context:
                         self._pending_tool_context = False
                         logger.info("Tool result was already received — starting audio pass now")
                         self.generation_task = asyncio.create_task(
-                            self._run_audio_from_tool_context()
+                            self._run_audio_from_tool_context(append_response=True)
                         )
                     return
 
-                # No tool calls — start audio pass for direct response.
-                logger.info("No tool call detected — starting direct audio pass")
-                self.generation_task = asyncio.create_task(
-                    self._run_audio_from_tool_context()
-                )
-                return
+                # No tool calls: audio was already sent inline above. Fall through
+                # to the sent_audio / ResponseAudioDone block at the end of the try.
 
             else:
-                # No tools and no instructions — single audio pass (fast path)
+                # No tools, no instructions — single audio pass (fast path)
                 result_gen = self.engine.generate(
                     prompt=streaming_input_gen,
                     request_id=request_id,
                     output_modalities=["audio"],
-                    sampling_params_list=self._make_audio_sampling_params_list(),
+                    sampling_params_list=coerce_param_message_types(list(self.engine.default_sampling_params_list), is_streaming=True),
                 )
                 full_text = ""
                 prompt_token_ids_len = 0
@@ -470,11 +457,8 @@ class RealtimeConnection(VllmRealtimeConnection):
                 await self.send(TranscriptionDone(text=full_text, usage=usage))
 
             if sent_audio:
-                await self.send_json({"type": "response.audio.done", "has_audio": True})
+                await self.send(ResponseAudioDone())
                 done_sent = True
-
-            while not self.audio_queue.empty():
-                self.audio_queue.get_nowait()
 
         except Exception as e:
             logger.exception("Error in generation: %s", e)
@@ -482,91 +466,112 @@ class RealtimeConnection(VllmRealtimeConnection):
         finally:
             if self._is_connected and not done_sent and sent_audio:
                 try:
-                    await self.send_json({"type": "response.audio.done", "has_audio": True})
+                    await self.send(ResponseAudioDone())
                 except Exception:
                     logger.exception("Failed to send response.audio.done")
+            # Drain any unconsumed audio into the cache. If the engine was aborted
+            # before consuming all audio (e.g. tool call detected mid-stream),
+            # audio_stream_generator only populated _cached_user_audio up to the
+            # abort point. Drain the rest here so the audio pass has the full clip.
             while not self.audio_queue.empty():
-                self.audio_queue.get_nowait()
+                chunk = self.audio_queue.get_nowait()
+                if chunk is not None:
+                    self._cached_user_audio.append(chunk)
 
-    async def _run_audio_from_tool_context(self) -> None:
+    async def _drain_and_run_audio(self) -> None:
+        """Consume audio queue into cache then run audio pass (instructions-only path).
+
+        Bypasses the text-only thinker pass when there are no tools — no tool
+        calls are possible so the extra pass would only add latency.
+        """
+        self._cached_user_audio = []
+        while True:
+            chunk = await self.audio_queue.get()
+            if chunk is None:
+                break
+            self._cached_user_audio.append(chunk)
+        await self._run_audio_from_tool_context(append_response=True)
+
+    async def _run_audio_from_tool_context(self, append_response: bool = False) -> None:
         """Generate speech after receiving tool results (or for direct responses).
 
-        Prompt structure (NO system section):
+        Prompt structure (proper Qwen3 chat-template format):
 
+            <|im_start|>system
+            {tools + instructions}
+            <|im_end|>
+            [prior turns: <assistant tool_call> + <user tool_response> blocks]
             <|im_start|>user
             <|audio_start|><|audio_pad|><|audio_end|>
             <|im_end|>
-            <|im_start|>user
-            {instructions + tool result — text-only, SKIPPED by talker}
-            <|im_end|>
+            [current turn: <assistant tool_call> + <user tool_response> blocks]
             <|im_start|>assistant
 
-        Why this works:
-        - Audio user section is at position [0:15] — identical to Phase 1.
-          The thinker has ZERO preceding tokens before the audio, so its
-          layer-24 hidden states at audio positions are purely acoustic.
-          hidden_projection maps these clean acoustic states → clear speech.
-        - The text instruction user section is text-only (no audio tokens),
-          so our fix in _thinker_to_talker_prefill SKIPS it. The talker
-          never sees the contaminating text embeddings.
-        - Causal attention means the audio tokens (positions 0-14) cannot
-          attend forward to the instruction (positions 15+), keeping the
-          audio hidden states acoustically pure.
-        - The thinker's assistant tokens CAN attend to both the audio AND
-          the instruction, generating a response about the tool result.
+        _thinker_to_talker_prefill and _compute_talker_prompt_ids_length both skip
+        system blocks, text-only user blocks, and non-last assistant blocks — only
+        the audio-bearing user block and the final assistant block feed into the
+        talker. The thinker still attends to all blocks for response generation.
+
+        Args:
+            append_response: When True, append an assistant conversation item with
+                the spoken text after generation. Set for tool-result and
+                instructions-only paths. Leave False for the no-tool-call path,
+                which already has an assistant item from the thinker pass.
         """
         sent_audio = False
         done_sent = False
+        spoken_text = ""
         self._realtime_audio_ref = None
+        t_audio_start = time.monotonic()
         try:
             audio_placeholder = "<|audio_start|><|audio_pad|><|audio_end|>"
 
-            # Collect tool results for the CURRENT turn's tool calls only.
-            current_call_ids = {tc.get("id") for tc in self.current_tool_calls}
-            tool_result_parts: list[str] = []
-            for item in self.conversation_items:
-                if item.get("role") == "tool":
-                    call_id = item.get("call_id")
-                    if call_id not in current_call_ids:
-                        continue
-                    result_content = item.get("content", "")
-                    tool_name = next(
-                        (tc["name"] for tc in self.current_tool_calls if tc.get("id") == call_id),
-                        "tool",
-                    )
-                    tool_result_parts.append(f"{tool_name} returned: {result_content}")
-
-            tool_result_summary = "\n".join(tool_result_parts)
-
-            # Two cases:
-            # (A) Tool-result turn: use ONLY the "Speak this" directive — no session
-            #     instructions, no history. Session instructions may contain explicit
-            #     tool-calling directives that bleed into the audio pass and push the
-            #     thinker toward tool-call token patterns rather than speech bootstrap.
-            # (B) Direct-response turn (no tool result): include session instructions
-            #     plus any prior conversation history for follow-up questions.
-            if tool_result_summary:
-                instruction_text = f"Speak this information to the user: {tool_result_summary}"
-            else:
-                instruction_parts: list[str] = []
-                if self.instructions:
-                    instruction_parts.append(self.instructions)
-                if self.conversation_items:
-                    history = self._build_conversation_context()
-                    if history:
-                        instruction_parts.append(f"Conversation history:\n{history}")
-                instruction_text = "\n".join(instruction_parts)
-
             parts: list[str] = []
+
+            # System block: tools + instructions (skipped by talker)
+            system_parts: list[str] = []
+            if self.tools:
+                system_parts.append(self._format_tools_for_prompt())
+            if self.instructions:
+                system_parts.append(self.instructions)
+            if system_parts:
+                system_body = "\n".join(system_parts)
+                parts.append(f"<|im_start|>system\n{system_body}<|im_end|>")
+
+            # Prior turns as proper chat-template blocks (non-last assistant
+            # blocks and text-only user blocks are skipped by talker; thinker
+            # attends to them for conversation context).
+            prior_items = self.conversation_items[: self._turn_start_idx]
+            for item in prior_items:
+                block = self._render_item_as_template_block(item)
+                if block:
+                    parts.append(block)
+
+            # Audio user block (included by talker for acoustic conditioning)
             parts.append(f"<|im_start|>user\n{audio_placeholder}<|im_end|>")
-            parts.append(f"<|im_start|>user\n{instruction_text}<|im_end|>")
-            parts.append("<|im_start|>assistant")
-            full_prompt = "\n".join(parts) + "\n"
+
+            # Current-turn tool interaction: assistant tool_call(s) and tool
+            # result(s). These appear after the audio so the thinker has
+            # temporal ordering right. Talker skips them (non-last assistant
+            # block + text-only user block).
+            current_items = self.conversation_items[self._turn_start_idx :]
+            current_tool_items = [
+                item for item in current_items
+                if item.get("role") == "tool"
+                or (item.get("role") == "assistant" and item.get("tool_calls"))
+            ]
+            for item in current_tool_items:
+                block = self._render_item_as_template_block(item)
+                if block:
+                    parts.append(block)
+
+            # Final assistant block (included by talker — this is where speech is generated)
+            parts.append("<|im_start|>assistant\n")
+            full_prompt = "\n".join(parts)
 
             # Use current-turn audio for acoustic conditioning so the talker's
             # hidden_projection receives full-length in-distribution features.
-            # Fall back to the first-turn cache only if the current buffer is empty.
-            ref_audio = self._cached_user_audio if self._cached_user_audio else self._turn_audio_cache
+            ref_audio = self._cached_user_audio
             audio_array = np.concatenate(ref_audio) if ref_audio else np.zeros(8000, dtype=np.float32)
 
             prompt = {
@@ -581,19 +586,42 @@ class RealtimeConnection(VllmRealtimeConnection):
                 prompt=prompt,
                 request_id=request_id,
                 output_modalities=["audio"],
-                sampling_params_list=self._make_audio_sampling_params_list(),
+                sampling_params_list=coerce_param_message_types(
+                    list(self.engine.default_sampling_params_list), is_streaming=True
+                ),
             )
 
             async for output in result_gen:
+                if output.outputs:
+                    spoken_text += output.outputs[0].text or ""
                 audio_chunks, sample_rate = self._extract_audio_chunks(output)
                 for chunk in audio_chunks:
+                    if not sent_audio:
+                        logger.info(
+                            "[TIMING] tool-context audio pass first chunk at %.2fs",
+                            time.monotonic() - t_audio_start,
+                        )
                     sent_audio = True
                     await self._send_audio_delta(chunk, sample_rate)
                 if not self._is_connected:
                     break
 
+            logger.info(
+                "[TIMING] tool-context audio pass done: %.2fs | sent_audio=%s",
+                time.monotonic() - t_audio_start,
+                sent_audio,
+            )
+            logger.info("[TEXT] Spoken text from audio pass: %r", spoken_text)
+            if append_response:
+                clean = self._clean_text_delta(self._strip_thinking(spoken_text))
+                self.conversation_items.append({
+                    "role": "assistant",
+                    "content": clean or None,
+                    "tool_calls": None,
+                })
+
             if sent_audio:
-                await self.send_json({"type": "response.audio.done", "has_audio": True})
+                await self.send(ResponseAudioDone())
                 done_sent = True
 
         except Exception as exc:
@@ -602,7 +630,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         finally:
             if not done_sent and sent_audio:
                 try:
-                    await self.send_json({"type": "response.audio.done", "has_audio": True})
+                    await self.send(ResponseAudioDone())
                 except Exception:
                     pass
 
@@ -610,30 +638,41 @@ class RealtimeConnection(VllmRealtimeConnection):
     # Conversation helpers
     # -------------------------------------------------------------------------
 
-    def _build_conversation_context(self) -> str:
-        """Build a text representation of conversation history."""
-        context_parts = []
-        for item in self.conversation_items:
-            role = item.get("role", "")
-            if role == "user":
-                content = item.get("content", "[User spoke]")
-                context_parts.append(f"User: {content}")
-            elif role == "assistant":
-                content = item.get("content", "")
-                tool_calls = item.get("tool_calls", [])
-                if content:
-                    clean = self._clean_text_delta(content)
-                    if clean:
-                        context_parts.append(f"Assistant: {clean}")
-                if tool_calls:
-                    for call in tool_calls:
-                        args_str = json.dumps(call.get("arguments", {}))
-                        context_parts.append(f"Assistant called: {call.get('name')}({args_str})")
-            elif role == "tool":
-                call_id = item.get("call_id", "")
-                content = item.get("content", "")
-                context_parts.append(f"Tool result [{call_id}]: {content}")
-        return "\n".join(context_parts)
+    def _render_item_as_template_block(self, item: dict) -> str:
+        """Render a conversation item as a proper Qwen3 chat-template block."""
+        role = item.get("role", "")
+        if role == "user":
+            content = item.get("content") or "[User's audio]"
+            return f"<|im_start|>user\n{content}<|im_end|>"
+        elif role == "assistant":
+            content_parts: list[str] = []
+            content = item.get("content")
+            if content:
+                clean = self._clean_text_delta(content)
+                if clean:
+                    content_parts.append(clean)
+            for call in (item.get("tool_calls") or []):
+                args_str = json.dumps({"name": call["name"], "arguments": call.get("arguments", {})})
+                content_parts.append(f"<tool_call>\n{args_str}\n</tool_call>")
+            if not content_parts:
+                return ""
+            return f"<|im_start|>assistant\n{''.join(content_parts)}<|im_end|>"
+        elif role == "tool":
+            content = item.get("content", "")
+            return f"<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>"
+        return ""
+
+    def _render_prior_blocks(self) -> str | None:
+        """Render prior-turn conversation items as proper Qwen3 chat-template blocks.
+
+        These are injected between the system block and the current audio user
+        block in buffer_realtime_audio, giving the thinker full conversation
+        context in the format it was trained on rather than prose in the system block.
+        """
+        prior_items = self.conversation_items[: self._turn_start_idx]
+        blocks = [self._render_item_as_template_block(item) for item in prior_items]
+        rendered = "\n".join(b for b in blocks if b)
+        return rendered or None
 
     def _format_tools_for_prompt(self) -> str:
         """Format tools using Qwen3's exact chat-template convention."""
@@ -653,16 +692,12 @@ class RealtimeConnection(VllmRealtimeConnection):
         )
 
     def _build_system_context(self) -> str | None:
-        """Build the system context string from instructions + tools + conversation history."""
+        """Build the system block content: tools definition + session instructions."""
         parts: list[str] = []
         if self.tools:
             parts.append(self._format_tools_for_prompt())
         if self.instructions:
             parts.append(self.instructions)
-        if self.conversation_items:
-            history = self._build_conversation_context()
-            if history:
-                parts.append(history)
         return "\n\n".join(parts) if parts else None
 
     def audio_stream_generator(self):
@@ -675,9 +710,6 @@ class RealtimeConnection(VllmRealtimeConnection):
                     break
                 self._cached_user_audio.append(audio_chunk)
                 yield audio_chunk
-            # Persist the first turn's audio as the acoustic reference.
-            if self._turn_audio_cache is None and self._cached_user_audio:
-                self._turn_audio_cache = list(self._cached_user_audio)
         return _gen()
 
     # -------------------------------------------------------------------------
@@ -690,7 +722,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         try:
             return self.tokenizer.decode(token_ids, skip_special_tokens=False)
         except Exception as e:
-            logger.warning(f"Failed to decode tokens: {e}")
+            logger.warning("Failed to decode tokens: %s", e)
             return ""
 
     def _parse_tool_call(self, tool_call_block: str) -> dict | None:
@@ -718,7 +750,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         if not self.tools:
             clean_delta = self._clean_text_delta(text_delta)
             if clean_delta:
-                await self.send_json({"type": "response.text.delta", "delta": clean_delta})
+                await self.send(ResponseTextDelta(delta=clean_delta))
             return
 
         self.accumulated_text += text_delta
@@ -730,14 +762,14 @@ class RealtimeConnection(VllmRealtimeConnection):
                 content_before = unprocessed[:tc_pos]
                 clean_content = self._clean_text_delta(content_before)
                 if clean_content:
-                    await self.send_json({"type": "response.text.delta", "delta": clean_content})
+                    await self.send(ResponseTextDelta(delta=clean_content))
                 self.in_tool_call = True
                 self.current_tool_call_id = f"call_{uuid4().hex[:24]}"
                 logger.debug("Tool call started")
             else:
                 clean_delta = self._clean_text_delta(text_delta)
                 if clean_delta:
-                    await self.send_json({"type": "response.text.delta", "delta": clean_delta})
+                    await self.send(ResponseTextDelta(delta=clean_delta))
 
         if self.in_tool_call:
             unprocessed = self.accumulated_text[self._text_proc_cursor:]
@@ -752,22 +784,16 @@ class RealtimeConnection(VllmRealtimeConnection):
                 parsed_call = self._parse_tool_call(tool_call_block)
                 if parsed_call:
                     args_json = json.dumps(parsed_call["arguments"])
-                    await self.send_json(
-                        {
-                            "type": "response.function_call_arguments.delta",
-                            "call_id": self.current_tool_call_id,
-                            "name": parsed_call["name"],
-                            "delta": args_json,
-                        }
-                    )
-                    await self.send_json(
-                        {
-                            "type": "response.function_call_arguments.done",
-                            "call_id": self.current_tool_call_id,
-                            "name": parsed_call["name"],
-                            "arguments": args_json,
-                        }
-                    )
+                    await self.send(ResponseFunctionCallArgumentsDelta(
+                        call_id=self.current_tool_call_id,
+                        name=parsed_call["name"],
+                        delta=args_json,
+                    ))
+                    await self.send(ResponseFunctionCallArgumentsDone(
+                        call_id=self.current_tool_call_id,
+                        name=parsed_call["name"],
+                        arguments=args_json,
+                    ))
                     self.current_tool_calls.append(
                         {
                             "id": self.current_tool_call_id,
@@ -780,13 +806,20 @@ class RealtimeConnection(VllmRealtimeConnection):
                 self._text_proc_cursor = tc_abs_end
                 self.in_tool_call = False
                 self.current_tool_call_id = None
-                self.current_function_name = None
-                self.tool_call_buffer = ""
 
                 remaining = self.accumulated_text[self._text_proc_cursor:]
                 clean_remaining = self._clean_text_delta(remaining)
                 if clean_remaining:
-                    await self.send_json({"type": "response.text.delta", "delta": clean_remaining})
+                    await self.send(ResponseTextDelta(delta=clean_remaining))
+
+    def _strip_thinking(self, text: str) -> str:
+        """Strip Qwen3 <think>...</think> blocks from thinker output."""
+        result = text
+        while "<think>" in result and "</think>" in result:
+            start = result.find("<think>")
+            end = result.find("</think>") + len("</think>")
+            result = result[:start] + result[end:]
+        return result.strip()
 
     def _clean_text_delta(self, text: str) -> str:
         clean = text
@@ -801,5 +834,5 @@ class RealtimeConnection(VllmRealtimeConnection):
     # WebSocket send
     # -------------------------------------------------------------------------
 
-    async def send_json(self, payload: dict):
-        await self.websocket.send_text(json.dumps(payload))
+    async def send(self, event: OpenAIBaseModel) -> None:  # type: ignore[override]
+        await self.websocket.send_text(event.model_dump_json())

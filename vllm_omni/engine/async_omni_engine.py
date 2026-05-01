@@ -13,6 +13,7 @@ import dataclasses
 import json
 import os
 import queue
+import signal
 import threading
 import time
 import uuid
@@ -957,13 +958,18 @@ class AsyncOmniEngine:
             except Exception:
                 pass
             if post_startup_crash:
-                # The orchestrator crashed after a successful startup.  Since
-                # this thread is a daemon, the main process would otherwise
-                # keep running in a silently broken state.  Force a hard exit
-                # with code 1 so the deployment can detect the failure and
-                # restart.
-                logger.error("[AsyncOmniEngine] Orchestrator crashed post-startup; forcing process exit (code 1)")
-                os._exit(1)
+                # Orchestrator crashed after startup completed. The fatal-error
+                # messages pushed above will surface OmniEngineDeadError to any
+                # in-flight requests, but new requests would otherwise hang on
+                # a queue the dead orchestrator can no longer service. Signal
+                # the main process to shut down so uvicorn runs its graceful
+                # shutdown path and the supervisor sees a non-zero exit
+                # (SIGTERM → 143 under Docker/Kubernetes) and can restart.
+                logger.error(
+                    "[AsyncOmniEngine] Orchestrator crashed post-startup; "
+                    "signaling process for shutdown",
+                )
+                os.kill(os.getpid(), signal.SIGTERM)
             raise
         finally:
             try:

@@ -1,0 +1,128 @@
+# 2-stage GPU layout on 2x A100 80GB
+# GPU 0: Thinker only, single GPU (no TP)
+#   - Qwen3-30B-A3B bf16 weights ≈ 61 GiB
+#   - gpu_memory_utilization: 0.15 → ~12 GiB KV budget, total ~73 GiB (6 GiB headroom)
+#   - KV cache actual need: ~7 GiB (max_num_seqs=1, max_model_len=32768, 28L/8KV-heads/128-dim)
+# GPU 1: Talker + Code2Wav (~19.5 GiB combined weights, share the remaining VRAM)
+#   - Talker:   gpu_memory_utilization: 0.35 → ~28 GiB KV; max_model_len/max_num_batched_tokens=8192 ≈ 13s audio
+#   - Code2Wav: gpu_memory_utilization: 0.20 → ~16 GiB KV; max_num_batched_tokens=65536 (covers talker max 7892 frames × 8 = 63K codec codes)
+#   - Combined GPU 1 usage: ≈ 63 GiB (16 GiB headroom)
+#
+# CRITICAL (vLLM v1 behavior): gpu_memory_utilization is a raw multiplier on total GPU memory;
+# it does NOT subtract model weights. Effective KV budget = util * total_memory, which is then
+# stacked ON TOP of already-loaded weights. So for GPU 0:
+#   util * 79.25 + 61 must be < 79.25  →  util < 0.23.  Using 0.15 gives ~12 GiB KV headroom.
+async_chunk: false
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: thinker
+      max_num_seqs: 1
+      model_arch: Qwen3OmniMoeForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.15
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      max_num_batched_tokens: 16384
+      max_model_len: 32768
+      hf_config_name: thinker_config
+      tensor_parallel_size: 1
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
+    final_output: true
+    final_output_type: text
+    is_comprehension: true
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 1.0
+      top_k: 1
+      max_tokens: 1024
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.05
+
+  - stage_id: 1
+    stage_type: llm
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
+    runtime:
+      devices: "1"
+      max_batch_size: 1
+    engine_args:
+      model_stage: talker
+      max_num_seqs: 1
+      model_arch: Qwen3OmniMoeForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.35
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      max_num_batched_tokens: 8192
+      max_model_len: 8192
+      distributed_executor_backend: "mp"
+      hf_config_name: talker_config
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
+    engine_input_source: [0]
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_k: 1
+      max_tokens: 20000
+      seed: 42
+      detokenize: False
+      repetition_penalty: 1.05
+      stop_token_ids: [2150]
+
+  - stage_id: 2
+    stage_type: llm
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav
+    runtime:
+      devices: "1"
+      max_batch_size: 1
+    engine_args:
+      model_stage: code2wav
+      max_num_seqs: 1
+      model_arch: Qwen3OmniMoeForConditionalGeneration
+      worker_type: generation
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      async_scheduling: false
+      enable_prefix_caching: false
+      engine_output_type: audio
+      gpu_memory_utilization: 0.20
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 65536
+      max_model_len: 65536
+      hf_config_name: thinker_config
+    engine_input_source: [1]
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 30000
+      seed: 42
+      detokenize: True
+      repetition_penalty: 1.1
+
+runtime:
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        codec_chunk_frames: 25
+        codec_left_context_frames: 25

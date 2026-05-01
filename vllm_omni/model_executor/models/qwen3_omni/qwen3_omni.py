@@ -219,6 +219,7 @@ class Qwen3OmniMoeForConditionalGeneration(
         input_stream: asyncio.Queue[list[int]],
         model_config: ModelConfig,
         conversation_context: str | None = None,
+        prior_blocks: str | None = None,
     ) -> AsyncGenerator[PromptType, None]:
         processor = cached_processor_from_config(model_config)
         feature_extractor = processor.feature_extractor
@@ -237,17 +238,19 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         prompt_token_ids = tokenizer.encode(prompt_template)
 
-        # If conversation context is provided, inject it as the first prompt
-        # This allows tool results and conversation history to be included
-        is_first_chunk = True
+        # Yield the entire non-audio prefix (system block + prior turn blocks) as ONE
+        # TokensPrompt. Splitting them into separate yields creates multiple text-only
+        # streaming checkpoints that the engine serialises, adding latency proportional
+        # to the number of extra yields before the first audio chunk arrives.
+        prefix_parts: list[str] = []
         if conversation_context:
-            # Build context prompt with system instructions + conversation history
-            context_prompt = f"<|im_start|>system\n{conversation_context}<|im_end|>\n"
-            context_token_ids = tokenizer.encode(context_prompt)
-            is_first_chunk = False
-
-            # Yield context as the first prompt
-            yield TokensPrompt(prompt_token_ids=context_token_ids)
+            prefix_parts.append(f"<|im_start|>system\n{conversation_context}<|im_end|>")
+        if prior_blocks:
+            prefix_parts.append(prior_blocks)
+        if prefix_parts:
+            prefix = "\n".join(prefix_parts) + "\n"
+            prefix_token_ids = tokenizer.encode(prefix)
+            yield TokensPrompt(prompt_token_ids=prefix_token_ids)
 
         async for audio_chunk in audio_stream:
             buffer.write_audio(audio_chunk)
@@ -257,7 +260,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                     prompt_token_ids=prompt_token_ids,
                     multi_modal_data={"audio": segment},
                 )
-                is_first_chunk = False
 
         remaining = buffer.flush()
         if remaining is not None and len(remaining) > 0:

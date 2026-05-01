@@ -23,14 +23,13 @@ class OpenAIServingRealtime(VllmOpenAIServingRealtime):
 
     def __init__(self, *args, speech_service=None, **kwargs):
         super().__init__(*args, **kwargs)
-        # Optional TTS service for generating audio responses
-        self.speech_service = speech_service
 
     async def transcribe_realtime(
         self,
         audio_stream: AsyncGenerator[np.ndarray, None],
         input_stream: asyncio.Queue[list[int]],
         conversation_context: str | None = None,
+        prior_blocks: str | None = None,
     ) -> AsyncGenerator[StreamingInput, None]:
         """Transform audio stream into StreamingInput for engine.generate().
 
@@ -40,8 +39,9 @@ class OpenAIServingRealtime(VllmOpenAIServingRealtime):
                 generation outputs. Used for autoregressive multi-turn
                 processing where each generation's output becomes the context
                 for the next iteration.
-            conversation_context: Optional conversation history and tool definitions
-                to inject into the prompt.
+            conversation_context: Optional system-block content (tools + instructions).
+            prior_blocks: Optional prior-turn chat-template blocks to inject between
+                the system block and the current audio user block.
 
         Yields:
             StreamingInput objects containing audio prompts for the engine
@@ -49,11 +49,10 @@ class OpenAIServingRealtime(VllmOpenAIServingRealtime):
         model_config = self.model_config
         renderer = self.renderer
 
-        # Call buffer_realtime_audio with conversation_context
         stream_input_iter = cast(
             AsyncGenerator[PromptType, None],
             self.model_cls.buffer_realtime_audio(
-                audio_stream, input_stream, model_config, conversation_context
+                audio_stream, input_stream, model_config, conversation_context, prior_blocks
             ),
         )
 
