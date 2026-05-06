@@ -14,6 +14,7 @@ import dataclasses
 import json
 import os
 import queue
+import signal
 import threading
 import time
 import uuid
@@ -1081,7 +1082,8 @@ class AsyncOmniEngine:
         try:
             loop.run_until_complete(_run_orchestrator())
         except Exception as e:
-            if not startup_future.done():
+            post_startup_crash = startup_future.done()
+            if not post_startup_crash:
                 wrapped = RuntimeError(f"Orchestrator initialization failed: {e}")
                 wrapped.__cause__ = e
                 startup_future.set_exception(wrapped)
@@ -1095,6 +1097,18 @@ class AsyncOmniEngine:
                     self.rpc_output_queue.sync_q.put_nowait(error_msg)
             except Exception:
                 pass
+            if post_startup_crash:
+                # The orchestrator thread is a daemon; if it crashes after
+                # startup, the main process keeps running in a silently
+                # broken state. Send SIGTERM to ourselves so uvicorn /
+                # asyncio shutdown handlers run (GPU cleanup, log flush,
+                # in-flight request drains) instead of os._exit() bypassing
+                # them. The orchestrator process exits non-zero, which is
+                # the signal the deployment watches for.
+                logger.error(
+                    "[AsyncOmniEngine] Orchestrator crashed post-startup; raising SIGTERM for graceful shutdown"
+                )
+                os.kill(os.getpid(), signal.SIGTERM)
             raise
         finally:
             try:
